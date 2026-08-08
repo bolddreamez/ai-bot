@@ -2,15 +2,16 @@ const express = require("express");
 const multer = require("multer");
 const { GoogleGenAI, createUserContent, createPartFromUri } = require("@google/genai");
 const fs = require("fs");
+const path = require("path");
 
 const router = express.Router();
 
-// Initialize the Gemini AI client
+// Initialize Gemini client
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
 
-// Store uploaded files in the "uploads" folder locally first
+// Configure disk storage
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, "uploads/");
@@ -23,7 +24,6 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
-// POST /upload -> Now transcribes using Gemini!
 router.post("/", upload.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({
@@ -35,42 +35,53 @@ router.post("/", upload.single("file"), async (req, res) => {
   let uploadResult;
 
   try {
-    // 1. Upload the file to Google's File API so Gemini can access it
+    // 1. Fallback MIME type detection for video/audio files
+    let detectedMimeType = req.file.mimetype;
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    
+    if (ext === ".mp4") detectedMimeType = "video/mp4";
+    else if (ext === ".mp3") detectedMimeType = "audio/mp3";
+    else if (ext === ".wav") detectedMimeType = "audio/wav";
+    else if (ext === ".mov") detectedMimeType = "video/mov";
+
+    console.log(`Uploading file: ${req.file.originalname} (${detectedMimeType})`);
+
+    // 2. Upload file to Google File API
     uploadResult = await ai.files.upload({
       file: req.file.path,
-      mimeType: req.file.mimetype,
+      mimeType: detectedMimeType,
     });
 
-    // 2. Wait for the file to finish processing if it's a large video/audio file
+    // 3. Poll until file processing is COMPLETE
     let fileState = await ai.files.get({ name: uploadResult.name });
-    while (fileState.state === "PROCESSING") {
-      console.log("Gemini is processing the file...");
-      await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2 seconds
+    let attempts = 0;
+
+    while (fileState.state === "PROCESSING" && attempts < 30) {
+      console.log("Gemini is processing the video file...");
+      await new Promise((resolve) => setTimeout(resolve, 3000)); // wait 3s
       fileState = await ai.files.get({ name: uploadResult.name });
+      attempts++;
     }
 
     if (fileState.state === "FAILED") {
-      throw new Error("Google File API processing failed.");
+      throw new Error("Gemini failed to process this video file. Ensure it contains audio and isn't corrupted.");
     }
 
-    // 3. Ask Gemini to transcribe using the explicit content helper formatting
+    // 4. Generate transcript using Gemini Flash
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash", // Fast and excellent for multimodal tasks
+      model: "gemini-2.5-flash",
       contents: createUserContent([
-        createPartFromUri(uploadResult.uri, uploadResult.mimeType),
-        "Provide a highly accurate word-for-word transcription of this audio. Do not summarize or add commentary."
+        createPartFromUri(uploadResult.uri, uploadResult.mimeType || detectedMimeType),
+        "Provide an accurate word-for-word transcript of the spoken audio in this video. If there is no speech, describe the audio."
       ]),
     });
 
-    // 4. Clean up: Delete the local file from your backend server
-    fs.unlink(req.file.path, (err) => {
-      if (err) console.error("Error deleting local file:", err);
-    });
-    
-    // 5. Clean up: Delete the file from Google's servers to be safe
+    // 5. Cleanup local and cloud temporary files
+    if (fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
     await ai.files.delete({ name: uploadResult.name });
 
-    // 6. Return the text transcript as JSON
     res.json({
       success: true,
       message: "File transcribed successfully using Gemini!",
@@ -80,14 +91,14 @@ router.post("/", upload.single("file"), async (req, res) => {
   } catch (error) {
     console.error("Gemini API Error:", error);
 
-    // Ensure local file is cleaned up even if the process fails
-    if (fs.existsSync(req.file.path)) {
+    // Clean up local temp file on error
+    if (req.file && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
     }
 
     res.status(500).json({
       success: false,
-      message: "Failed to transcribe the audio file using Gemini.",
+      message: "Failed to transcribe the file using Gemini.",
       error: error.message,
     });
   }
